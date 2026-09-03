@@ -50,6 +50,21 @@ def init_db():
         )
     """)
 
+    # ---------- WORKER SESSIONS (NEW in Phase 1) ----------
+    # One row per login. logout_time/duration_seconds stay NULL until the
+    # worker logs out (or closes the app, which we also catch).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS worker_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id INTEGER NOT NULL,
+            login_time TEXT NOT NULL,
+            logout_time TEXT,
+            duration_seconds INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (worker_id) REFERENCES users(id)
+        )
+    """)
+
     # ---------- SERVICES (Xerox, Printing, Passport Photo, ...) ----------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS services (
@@ -224,3 +239,80 @@ def get_today_summary():
         "expenses": 0.0,
         "expected_drawer": 0.0,
     }
+
+
+# =====================================================================
+# PHASE 1 — Worker session tracking
+# =====================================================================
+
+def start_worker_session(worker_id: int) -> int:
+    """Record a new login session for a worker. Returns the new session's id."""
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "INSERT INTO worker_sessions (worker_id, login_time, created_at) VALUES (?, ?, ?)",
+        (worker_id, now, now),
+    )
+    conn.commit()
+    session_id = cur.lastrowid
+    conn.close()
+    return session_id
+
+
+def end_worker_session(session_id: int):
+    """Fill in the logout time and duration for a session that just ended."""
+    if session_id is None:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT login_time, logout_time FROM worker_sessions WHERE id = ?", (session_id,))
+    row = cur.fetchone()
+    if row is None or row["logout_time"] is not None:
+        # Either the session doesn't exist, or it was already closed once
+        # (this can happen if logout AND window-close both fire - harmless).
+        conn.close()
+        return
+    login_time = datetime.fromisoformat(row["login_time"])
+    now = datetime.now()
+    duration = int((now - login_time).total_seconds())
+    cur.execute(
+        "UPDATE worker_sessions SET logout_time = ?, duration_seconds = ? WHERE id = ?",
+        (now.isoformat(timespec="seconds"), duration, session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+# =====================================================================
+# PHASE 1 — Application activity tracking
+# (writes into the application_activity table that already existed)
+# =====================================================================
+
+def log_activity_start(worker_id: int, app_name: str, start_time: datetime) -> int:
+    """Record that a watched application just started. Returns the new row's id."""
+    conn = get_connection()
+    cur = conn.cursor()
+    ts = start_time.isoformat(timespec="seconds")
+    cur.execute(
+        "INSERT INTO application_activity (worker_id, app_name, start_time, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (worker_id, app_name, ts, ts),
+    )
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+    return row_id
+
+
+def log_activity_end(row_id: int, start_time: datetime, end_time: datetime):
+    """Fill in the end time and duration once a watched application closes."""
+    conn = get_connection()
+    cur = conn.cursor()
+    duration = int((end_time - start_time).total_seconds())
+    cur.execute(
+        "UPDATE application_activity SET end_time = ?, duration_seconds = ? WHERE id = ?",
+        (end_time.isoformat(timespec="seconds"), duration, row_id),
+    )
+    conn.commit()
+    conn.close()
