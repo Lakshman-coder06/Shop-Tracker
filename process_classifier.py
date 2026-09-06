@@ -18,6 +18,14 @@ be noisy on your shop PC.
 FRIENDLY_NAMES is separate and purely cosmetic - a nicer display name for
 common programs. Anything not listed still gets shown, just using a
 cleaned-up version of its file name (e.g. "SomeNewApp.exe" -> "SomeNewApp").
+
+NOTE (Phase 3): activity_monitor.py switched from process-enumeration to
+foreground-window detection, which makes classify_process() below no
+longer the active filtering mechanism - a background process can no
+longer become "the foreground window" in the first place, so the
+system/user distinction it draws isn't needed for filtering anymore.
+It's left in place (harmless, still correct) in case a future feature
+wants it. friendly_name() is still actively used for display names.
 """
 
 from __future__ import annotations  # lets us use modern type hints on older Python too

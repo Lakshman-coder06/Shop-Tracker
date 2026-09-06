@@ -1,46 +1,53 @@
 """
 activity_monitor.py
 --------------------
-Detects application activity for the currently logged-in worker, using
-TWO separate mechanisms, because Windows applications work two different
-ways:
+PHASE 3 REWRITE: foreground-window detection, replacing Phase 1.5's
+process-enumeration approach.
 
-1. ProcessActivityWatcher - for normal programs (Chrome, Word, Photoshop,
-   Notepad, VLC, and anything else). These each run as their own process,
-   so we can watch the list of running processes and notice when a new
-   one appears/disappears. This is DYNAMIC: it classifies every process
-   it sees via process_classifier.py rather than checking a fixed list,
-   so it detects programs that didn't exist when this file was written.
+WHY THE CHANGE: Phase 1.5 watched every running process and classified
+each as system/user - but "is this process running" isn't the same as
+"is the worker actually using this." A program can sit open in the
+background for hours without being touched. This version instead asks
+Windows one simple question, repeatedly: "which window is currently in
+the foreground - the one the worker is actually looking at and typing
+into?" That is a much more accurate proxy for real usage, and as a bonus
+it completely solves the File Explorer problem from Phase 1.5 in a
+simpler way: a File Explorer folder window genuinely DOES become the
+foreground window when you click into it, so no separate window-counting
+watcher is needed anymore - one mechanism now covers every application.
 
-2. FileExplorerWindowWatcher - for File Explorer specifically. explorer.exe
-   is the Windows shell - it draws the taskbar and desktop and is already
-   running before Shop Tracker starts, for as long as you're logged into
-   Windows. Opening a folder doesn't start a new process, so watcher #1
-   can never see File Explorer "start" or "stop". The only way to detect
-   an actual File Explorer window opening/closing is to watch WINDOWS
-   directly: every normal File Explorer folder window has had the window
-   class name "CabinetWClass" since Windows 7. This watcher counts how
-   many windows with that class exist, the same way watcher #1 counts
-   processes - grouped, not per-window, to avoid a flood of entries when
-   several folder windows are open at once.
+HOW IT WORKS: every 2 seconds, ask Windows for the foreground window's
+owning process (via win32gui.GetForegroundWindow +
+win32process.GetWindowThreadProcessId + psutil). If it's a different
+program than the one currently being tracked, close out the old entry and
+open a new one - this naturally produces exactly the "Photoshop opened ->
+Photoshop closed, Chrome opened -> ..." timeline from the spec, driven by
+real window switches instead of process start/stop.
 
-Both watchers write into the same 'application_activity' table via
-database.log_activity_start / log_activity_end - no separate table.
+TWO DELIBERATE EXCLUSIONS (not tracked as "activity"):
+ - Shop Tracker's own windows. Otherwise every click back into Shop
+   Tracker to save a job would interrupt whatever was being tracked
+   before it. Instead, Shop Tracker's own foreground time is transparent:
+   the previously-tracked app just keeps running underneath it, and gets
+   properly closed out next time a DIFFERENT real app comes forward.
+ - The Windows desktop/taskbar/Start menu (explorer.exe's shell chrome,
+   as opposed to an actual File Explorer folder window - the two are
+   told apart by window class name, see FILE_EXPLORER_WINDOW_CLASS).
 
-WHAT THIS DOES: reads (a) the list of running process names/paths, and
-(b) the list of visible top-level window handles + their class names.
-That's it.
+WHAT THIS NEVER DOES: no keylogging, no clipboard/password capture, no
+screen recording, no reading of typed text or web page contents. It only
+ever reads (a) which window is in front, (b) that window's process name
+and title, and (c) the clock. Window TITLE is captured (per the request)
+since it can help tell activities apart, but is not shown prominently in
+the main views because it can contain customer/document names - it's only
+surfaced in Activity Details, and never sent anywhere.
 
-WHAT THIS NEVER DOES:
- - No keylogging, no password/clipboard capture
- - No screen recording, no webcam/microphone access
- - No reading of window TITLES, file contents, or browser history/URLs
- - Only runs while a worker is logged into Shop Tracker
-
-ActivityMonitor (at the bottom) is the single object the rest of the app
-talks to - it owns exactly one of each watcher and combines their
-results, so there is never more than one poller running per login and
-never a risk of duplicate records.
+TESTABILITy NOTE: the actual Windows API calls (_default_foreground_info)
+can only be exercised on a real Windows machine. Everything else here -
+the switching logic, the Shop-Tracker/desktop exclusions, multi-step
+sequences - is decoupled from that one function via the `foreground_provider`
+constructor argument, so it's fully testable by substituting a fake
+sequence of foreground windows. See the test suite for exactly that.
 """
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -59,13 +66,15 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 try:
-    import win32gui  # part of pywin32 - Windows only
+    import win32gui
+    import win32process
     WIN32_AVAILABLE = True
 except ImportError:
     WIN32_AVAILABLE = False
 
-POLL_INTERVAL_MS = 2000  # check every 2 seconds
-FILE_EXPLORER_WINDOW_CLASS = "CabinetWClass"  # File Explorer folder window class since Windows 7
+POLL_INTERVAL_MS = 2000
+FILE_EXPLORER_WINDOW_CLASS = "CabinetWClass"  # a real File Explorer folder window
+SELF_WINDOW_TITLE_HINT = "Shop Work & Collection Tracker"  # matches every window title this app sets
 
 
 def _safe_computer_name():
@@ -82,125 +91,61 @@ def _safe_username():
         return None
 
 
-# =====================================================================
-# Watcher 1: normal processes (dynamic, no hardcoded app list)
-# =====================================================================
+def _default_foreground_info():
+    """The real Windows implementation. Returns a dict with exe_name,
+    window_title, class_name, pid - or None if nothing meaningful can be
+    determined right now (nothing is foreground, access denied, etc).
+    This is the ONLY function in this file that talks to actual Windows
+    APIs - everything else takes its output as plain data."""
+    if not (WIN32_AVAILABLE and PSUTIL_AVAILABLE):
+        return None
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return None
+        class_name = win32gui.GetClassName(hwnd)
+        window_title = win32gui.GetWindowText(hwnd)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if not pid:
+            return None
+        proc = psutil.Process(pid)
+        exe_name = proc.name()
+        return {"exe_name": exe_name, "window_title": window_title, "class_name": class_name, "pid": pid}
+    except Exception:
+        return None
 
-class ProcessActivityWatcher(QObject):
-    """
-    Every poll: lists all running processes, classifies each one, and
-    treats "at least one process with this executable name is running"
-    as one activity - regardless of how many individual processes that
-    program actually uses. This is what makes multi-process programs
-    like Chrome show up as ONE entry instead of dozens.
-    """
+
+class ForegroundWindowWatcher(QObject):
+    """Tracks the single application currently in the foreground for one
+    worker's session. See the module docstring for the full explanation."""
 
     activity_started = Signal(str)
     activity_stopped = Signal(str, int)
 
-    def __init__(self, worker_id, computer_name, windows_username):
+    def __init__(self, worker_id, computer_name, windows_username, foreground_provider=None):
         super().__init__()
         self.worker_id = worker_id
         self.computer_name = computer_name
         self.windows_username = windows_username
-        self.running = {}  # exe_name_lower -> {"friendly": str, "start_time": datetime, "row_id": int}
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.poll)
+        # Dependency injection point: production uses the real Windows call;
+        # tests substitute a fake sequence of foreground-window snapshots.
+        self.foreground_provider = foreground_provider or _default_foreground_info
         self.self_pid = os.getpid()
 
-        self.last_scan_time = None
-        self.last_process_count = 0
-        self.last_user_app_count = 0
-        self.last_error = None
+        self.current_key = None        # lowercase exe name of the app currently tracked, or None
+        self.current_friendly = None
+        self.current_row_id = None
+        self.current_start = None
+        self.current_title = None
 
-    def start(self):
-        if not PSUTIL_AVAILABLE:
-            return
-        self.poll()
-        self.timer.start(POLL_INTERVAL_MS)
-
-    def stop(self):
-        self.timer.stop()
-        now = datetime.now()
-        for exe_key in list(self.running.keys()):
-            self._end(exe_key, now)
-
-    def poll(self):
-        if not PSUTIL_AVAILABLE:
-            return
-        try:
-            procs = list(psutil.process_iter(["pid", "name", "exe"]))
-        except Exception as e:
-            self.last_error = str(e)
-            return  # try again next cycle rather than crashing
-
-        self.last_scan_time = datetime.now()
-        self.last_process_count = len(procs)
-
-        current_user_apps = {}  # exe_name_lower -> friendly name
-        for proc in procs:
-            try:
-                name = proc.info.get("name") or ""
-                if not name:
-                    continue
-                exe_path = proc.info.get("exe")
-                is_self = proc.info.get("pid") == self.self_pid
-                category = process_classifier.classify_process(name, exe_path, is_self)
-                if category == "user":
-                    current_user_apps[name.lower()] = process_classifier.friendly_name(name)
-            except Exception:
-                continue  # a single odd process should never break the whole scan
-
-        self.last_user_app_count = len(current_user_apps)
-        now = datetime.now()
-
-        for exe_key, friendly in current_user_apps.items():
-            if exe_key not in self.running:
-                row_id = database.log_activity_start(
-                    self.worker_id, friendly, exe_key, now,
-                    self.computer_name, self.windows_username,
-                )
-                self.running[exe_key] = {"friendly": friendly, "start_time": now, "row_id": row_id}
-                self.activity_started.emit(friendly)
-
-        for exe_key in list(self.running.keys()):
-            if exe_key not in current_user_apps:
-                self._end(exe_key, now)
-
-    def _end(self, exe_key, end_time):
-        info = self.running.pop(exe_key, None)
-        if info is None:
-            return
-        database.log_activity_end(info["row_id"], info["start_time"], end_time)
-        duration = int((end_time - info["start_time"]).total_seconds())
-        self.activity_stopped.emit(info["friendly"], duration)
-
-    def currently_open(self):
-        return [(v["friendly"], v["start_time"]) for v in self.running.values()]
-
-
-# =====================================================================
-# Watcher 2: File Explorer, at the window level (Windows only)
-# =====================================================================
-
-class FileExplorerWindowWatcher(QObject):
-    """See the module docstring above for why this exists as a separate,
-    window-level watcher instead of being handled by watcher #1."""
-
-    activity_started = Signal(str)
-    activity_stopped = Signal(str, int)
-
-    def __init__(self, worker_id, computer_name, windows_username):
-        super().__init__()
-        self.worker_id = worker_id
-        self.computer_name = computer_name
-        self.windows_username = windows_username
-        self.open_hwnds = set()
-        self.first_open_time = None
-        self.row_id = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll)
-        self.available = WIN32_AVAILABLE
+
+        self.last_scan_time = None
+        self.last_info = None
+        # A custom provider (tests) doesn't need the real Windows libraries at
+        # all - only the default, real-Windows path depends on them.
+        self.available = (foreground_provider is not None) or (WIN32_AVAILABLE and PSUTIL_AVAILABLE)
 
     def start(self):
         if not self.available:
@@ -209,108 +154,121 @@ class FileExplorerWindowWatcher(QObject):
         self.timer.start(POLL_INTERVAL_MS)
 
     def stop(self):
-        if not self.available:
-            return
         self.timer.stop()
-        if self.open_hwnds:
-            self._close(datetime.now())
+        if self.current_key is not None:
+            self._end_current(datetime.now())
 
     def poll(self):
         if not self.available:
             return
-        hwnds = set()
         try:
-            def _enum(hwnd, _):
-                if not win32gui.IsWindowVisible(hwnd):
-                    return
-                try:
-                    cls = win32gui.GetClassName(hwnd)
-                except Exception:
-                    return
-                if cls == FILE_EXPLORER_WINDOW_CLASS:
-                    hwnds.add(hwnd)
-            win32gui.EnumWindows(_enum, None)
+            info = self.foreground_provider()
         except Exception:
-            return  # try again next cycle
+            return  # try again next cycle rather than crashing
+        self.last_scan_time = datetime.now()
+        self.last_info = info
+        now = self.last_scan_time
 
-        now = datetime.now()
-        was_open = len(self.open_hwnds) > 0
-        self.open_hwnds = hwnds
-        is_open = len(self.open_hwnds) > 0
+        if info is None:
+            return  # couldn't determine foreground window this cycle - leave state as-is
 
-        if is_open and not was_open:
-            self.first_open_time = now
-            self.row_id = database.log_activity_start(
-                self.worker_id, "File Explorer", "explorer.exe (window)", now,
-                self.computer_name, self.windows_username,
-            )
-            self.activity_started.emit("File Explorer")
-        elif not is_open and was_open:
-            self._close(now)
+        if info.get("pid") == self.self_pid:
+            return  # Shop Tracker itself is in front - transparent, don't touch tracked state
 
-    def _close(self, end_time):
-        if self.row_id is not None and self.first_open_time is not None:
-            database.log_activity_end(self.row_id, self.first_open_time, end_time)
-            duration = int((end_time - self.first_open_time).total_seconds())
-            self.activity_stopped.emit("File Explorer", duration)
-        self.open_hwnds = set()
-        self.row_id = None
-        self.first_open_time = None
+        exe_name = info.get("exe_name") or ""
+        class_name = info.get("class_name") or ""
+        key = exe_name.lower()
 
-    def currently_open(self):
-        if not self.open_hwnds or self.first_open_time is None:
-            return []
-        return [("File Explorer", self.first_open_time)]
+        if key == "explorer.exe" and class_name != FILE_EXPLORER_WINDOW_CLASS:
+            # This is the desktop, taskbar, or Start menu - not a real app
+            # the worker opened. Treat it like nothing meaningful is in front.
+            self._end_current(now)
+            return
+
+        friendly = "File Explorer" if key == "explorer.exe" else process_classifier.friendly_name(exe_name)
+
+        if self.current_key == key:
+            return  # same app still in front - nothing changed
+
+        self._end_current(now)
+        self._start_new(key, friendly, info.get("window_title"), now)
+
+    def _end_current(self, end_time):
+        if self.current_key is None:
+            return
+        database.log_activity_end(self.current_row_id, self.current_start, end_time)
+        duration = int((end_time - self.current_start).total_seconds())
+        self.activity_stopped.emit(self.current_friendly, duration)
+        self.current_key = None
+        self.current_friendly = None
+        self.current_row_id = None
+        self.current_start = None
+        self.current_title = None
+
+    def _start_new(self, key, friendly, window_title, start_time):
+        row_id = database.log_activity_start(
+            self.worker_id, friendly, key, start_time,
+            self.computer_name, self.windows_username, window_title,
+        )
+        self.current_key = key
+        self.current_friendly = friendly
+        self.current_row_id = row_id
+        self.current_start = start_time
+        self.current_title = window_title
+        self.activity_started.emit(friendly)
+
+    def current_app(self):
+        """Returns (friendly_name, start_time, window_title) for the Live
+        Activity screen's 'Current Application' card, or None if nothing
+        is currently being tracked."""
+        if self.current_key is None:
+            return None
+        return (self.current_friendly, self.current_start, self.current_title)
 
     def diagnostic_status(self):
         if not self.available:
-            return "UNAVAILABLE (pywin32 not installed — run: pip install pywin32)"
-        return f"ACTIVE (window-class monitoring: {FILE_EXPLORER_WINDOW_CLASS})"
+            missing = []
+            if not WIN32_AVAILABLE:
+                missing.append("pywin32")
+            if not PSUTIL_AVAILABLE:
+                missing.append("psutil")
+            return f"UNAVAILABLE (missing: {', '.join(missing)} — run: pip install " + " ".join(missing) + ")"
+        return "ACTIVE (foreground-window detection)"
 
-
-# =====================================================================
-# Combined facade - this is the one object the rest of the app uses
-# =====================================================================
 
 class ActivityMonitor(QObject):
-    """Owns exactly one ProcessActivityWatcher and one FileExplorerWindowWatcher,
-    and presents them to the rest of the app as a single monitor with one
-    start(), one stop(), and combined signals/queries."""
+    """Thin facade so the rest of the app (Dashboard, Live Activity,
+    Diagnostics) has one simple object to talk to, regardless of what's
+    happening underneath."""
 
     activity_started = Signal(str)
     activity_stopped = Signal(str, int)
 
-    def __init__(self, worker_id):
+    def __init__(self, worker_id, foreground_provider=None):
         super().__init__()
         self.worker_id = worker_id
         self.computer_name = _safe_computer_name()
         self.windows_username = _safe_username()
 
-        self.process_watcher = ProcessActivityWatcher(worker_id, self.computer_name, self.windows_username)
-        self.explorer_watcher = FileExplorerWindowWatcher(worker_id, self.computer_name, self.windows_username)
-
-        self.process_watcher.activity_started.connect(self.activity_started.emit)
-        self.process_watcher.activity_stopped.connect(self.activity_stopped.emit)
-        self.explorer_watcher.activity_started.connect(self.activity_started.emit)
-        self.explorer_watcher.activity_stopped.connect(self.activity_stopped.emit)
+        self.watcher = ForegroundWindowWatcher(
+            worker_id, self.computer_name, self.windows_username, foreground_provider,
+        )
+        self.watcher.activity_started.connect(self.activity_started.emit)
+        self.watcher.activity_stopped.connect(self.activity_stopped.emit)
 
     def start(self):
-        self.process_watcher.start()
-        self.explorer_watcher.start()
+        self.watcher.start()
 
     def stop(self):
-        self.process_watcher.stop()
-        self.explorer_watcher.stop()
+        self.watcher.stop()
 
-    def currently_open(self):
-        return self.process_watcher.currently_open() + self.explorer_watcher.currently_open()
+    def current_app(self):
+        return self.watcher.current_app()
 
     def insert_test_event(self):
-        """Inserts a fake 'Test Application' activity that auto-closes after
-        5 seconds. This is NOT real detection - it only proves the
-        recording + display pipeline itself works, so you can tell a
-        recording problem apart from a detection problem. Clearly labeled
-        wherever it's shown."""
+        """Inserts a fake 'Test Event' that auto-closes after 5 seconds -
+        NOT real detection, only proves the recording+display pipeline
+        works. Clearly labeled wherever it's shown."""
         now = datetime.now()
         row_id = database.log_activity_start(
             self.worker_id, "Test Event (synthetic)", "test.synthetic", now,
@@ -327,14 +285,13 @@ class ActivityMonitor(QObject):
         QTimer.singleShot(5000, _end)
 
     def diagnostics(self):
+        current = self.current_app()
         return {
-            "monitoring_active": self.process_watcher.timer.isActive(),
-            "psutil_available": PSUTIL_AVAILABLE,
-            "last_scan": self.process_watcher.last_scan_time,
-            "processes_detected": self.process_watcher.last_process_count,
-            "user_apps_detected": self.process_watcher.last_user_app_count,
-            "currently_open_count": len(self.currently_open()),
-            "explorer_status": self.explorer_watcher.diagnostic_status(),
+            "monitoring_active": self.watcher.timer.isActive(),
+            "available": self.watcher.available,
+            "status_text": self.watcher.diagnostic_status(),
+            "last_scan": self.watcher.last_scan_time,
+            "current_app": current[0] if current else None,
             "computer_name": self.computer_name,
             "windows_username": self.windows_username,
             "worker_id": self.worker_id,

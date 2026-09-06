@@ -199,6 +199,30 @@ def _migrate_schema(conn):
     if "notes" not in existing_cols:
         cur.execute("ALTER TABLE expenses ADD COLUMN notes TEXT")
 
+    # --- users (Phase 3: worker management, PIN reset, temp-PIN flow) ---
+    cur.execute("PRAGMA table_info(users)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "status" not in existing_cols:
+        # Backfill from the existing active flag so nobody's login state changes
+        cur.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'Active'")
+        cur.execute("UPDATE users SET status = CASE WHEN active = 1 THEN 'Active' ELSE 'Inactive' END")
+    if "employee_id" not in existing_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN employee_id TEXT")
+    if "must_change_pin" not in existing_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN must_change_pin INTEGER DEFAULT 0")
+
+    # --- transactions (Phase 3: advance/balance for Pending jobs) ---
+    cur.execute("PRAGMA table_info(transactions)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "advance_amount" not in existing_cols:
+        cur.execute("ALTER TABLE transactions ADD COLUMN advance_amount REAL DEFAULT 0")
+
+    # --- application_activity (Phase 3: foreground-window title, when useful) ---
+    cur.execute("PRAGMA table_info(application_activity)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "window_title" not in existing_cols:
+        cur.execute("ALTER TABLE application_activity ADD COLUMN window_title TEXT")
+
     conn.commit()
 
     # --- services: add any new ones that don't already exist by name ---
@@ -268,10 +292,12 @@ def verify_login(user_id: int, pin: str):
     return None
 
 
-def get_today_summary():
+def get_today_summary(worker_id: int = None):
     """
-    Real dashboard numbers for today, computed from actual transactions
-    and expenses.
+    Today's numbers, computed from actual transactions and expenses.
+    Pass worker_id to scope everything to just that worker ("My Sales" on
+    the Worker dashboard) - leave it None for shop-wide totals (Admin
+    dashboard only).
       - jobs: count of all non-cancelled transactions today
       - sales/cash/upi: only transactions that are actually PAID (a Pending
         job that hasn't been paid yet doesn't count as money in hand)
@@ -281,44 +307,46 @@ def get_today_summary():
     """
     conn = get_connection()
     cur = conn.cursor()
+    w = " AND worker_id = ?" if worker_id is not None else ""
+    p = (worker_id,) if worker_id is not None else ()
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT COUNT(*) FROM transactions
-        WHERE date(created_at) = date('now', 'localtime') AND status != 'Cancelled'
-    """)
+        WHERE date(created_at) = date('now', 'localtime') AND status != 'Cancelled' {w}
+    """, p)
     jobs = cur.fetchone()[0]
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT COALESCE(SUM(amount), 0) FROM transactions
         WHERE date(created_at) = date('now', 'localtime')
-          AND status != 'Cancelled' AND payment_status = 'Paid'
-    """)
+          AND status != 'Cancelled' AND payment_status = 'Paid' {w}
+    """, p)
     sales = cur.fetchone()[0]
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT COALESCE(SUM(amount), 0) FROM transactions
         WHERE date(created_at) = date('now', 'localtime')
-          AND status != 'Cancelled' AND payment_status = 'Paid' AND payment_method = 'Cash'
-    """)
+          AND status != 'Cancelled' AND payment_status = 'Paid' AND payment_method = 'Cash' {w}
+    """, p)
     cash = cur.fetchone()[0]
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT COALESCE(SUM(amount), 0) FROM transactions
         WHERE date(created_at) = date('now', 'localtime')
-          AND status != 'Cancelled' AND payment_status = 'Paid' AND payment_method = 'UPI'
-    """)
+          AND status != 'Cancelled' AND payment_status = 'Paid' AND payment_method = 'UPI' {w}
+    """, p)
     upi = cur.fetchone()[0]
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT COALESCE(SUM(amount), 0) FROM expenses
-        WHERE date(created_at) = date('now', 'localtime')
-    """)
+        WHERE date(created_at) = date('now', 'localtime') {w}
+    """, p)
     expenses_all = cur.fetchone()[0]
 
-    cur.execute("""
+    cur.execute(f"""
         SELECT COALESCE(SUM(amount), 0) FROM expenses
-        WHERE date(created_at) = date('now', 'localtime') AND payment_method = 'Cash'
-    """)
+        WHERE date(created_at) = date('now', 'localtime') AND payment_method = 'Cash' {w}
+    """, p)
     cash_expenses = cur.fetchone()[0]
 
     conn.close()
@@ -330,6 +358,21 @@ def get_today_summary():
         "expenses": expenses_all,
         "expected_drawer": cash - cash_expenses,
     }
+
+
+def get_worker_performance_today():
+    """One row per active worker with today's numbers - powers the Admin
+    dashboard's 'Worker Performance' section. Uses get_today_summary()
+    under the hood so the math is identical to what each worker sees on
+    their own dashboard."""
+    workers = get_active_workers()
+    result = []
+    for w in workers:
+        if w["role"] == "admin":
+            continue  # Admin doesn't do jobs - no point showing a zeroed row
+        summary = get_today_summary(worker_id=w["id"])
+        result.append({"worker_id": w["id"], "worker_name": w["name"], **summary})
+    return result
 
 
 def get_active_services():
@@ -393,16 +436,16 @@ def end_worker_session(session_id: int):
 
 def log_activity_start(worker_id: int, app_name: str, process_name: str,
                         start_time: datetime, computer_name: str = None,
-                        windows_username: str = None) -> int:
+                        windows_username: str = None, window_title: str = None) -> int:
     """Record that an application/window just started. Returns the new row's id."""
     conn = get_connection()
     cur = conn.cursor()
     ts = start_time.isoformat(timespec="seconds")
     cur.execute(
         "INSERT INTO application_activity "
-        "(worker_id, app_name, process_name, start_time, computer_name, windows_username, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (worker_id, app_name, process_name, ts, computer_name, windows_username, ts),
+        "(worker_id, app_name, process_name, start_time, computer_name, windows_username, window_title, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (worker_id, app_name, process_name, ts, computer_name, windows_username, window_title, ts),
     )
     conn.commit()
     row_id = cur.lastrowid
@@ -566,11 +609,15 @@ def _next_daily_code(cur, table: str, code_column: str, prefix: str) -> str:
 
 def create_transaction(worker_id: int, service_id: int, quantity: int, rate: float,
                         payment_method: str, status: str,
-                        customer_reference: str = None, notes: str = None):
+                        customer_reference: str = None, notes: str = None,
+                        advance_amount: float = 0):
     """Saves one job. payment_status is derived from status: a job marked
     Completed at entry time is assumed paid on the spot (matches how a
-    walk-in shop works); a Pending job is assumed unpaid until someone
-    marks it paid later from Pending Records. Returns (id, transaction_code)."""
+    walk-in shop works); Pending/In Progress jobs are assumed unpaid until
+    someone marks them paid later from Pending Records - unless an advance
+    was taken, which is tracked separately (advance_amount) and doesn't by
+    itself flip payment_status to Paid, since a balance may still be owed.
+    Returns (id, transaction_code)."""
     conn = get_connection()
     cur = conn.cursor()
     now = datetime.now().isoformat(timespec="seconds")
@@ -581,10 +628,10 @@ def create_transaction(worker_id: int, service_id: int, quantity: int, rate: flo
     cur.execute(
         "INSERT INTO transactions "
         "(transaction_code, worker_id, service_id, quantity, amount, rate, payment_method, "
-        " status, payment_status, customer_reference, notes, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " status, payment_status, customer_reference, notes, advance_amount, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (code, worker_id, service_id, quantity, amount, rate, payment_method,
-         status, payment_status, customer_reference, notes, now, now),
+         status, payment_status, customer_reference, notes, advance_amount, now, now),
     )
     conn.commit()
     row_id = cur.lastrowid
@@ -636,19 +683,26 @@ def get_today_transaction_totals():
     return {"jobs": jobs, "sales": sales, "cash": cash, "upi": upi}
 
 
-def get_pending_transactions():
+def get_pending_transactions(worker_id: int = None):
     """Anything not yet both Completed and Paid (and not Cancelled) - what
-    the Pending Records screen shows."""
+    the Pending Records screen shows. Pass worker_id to scope to one
+    worker's own pending jobs only (this is the fix for the privacy gap
+    where any worker could previously see every worker's pending jobs)."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
+    query = """
         SELECT t.*, u.name AS worker_name, s.name AS service_name
         FROM transactions t
         JOIN users u ON u.id = t.worker_id
         JOIN services s ON s.id = t.service_id
         WHERE t.status != 'Cancelled' AND NOT (t.status = 'Completed' AND t.payment_status = 'Paid')
-        ORDER BY t.created_at DESC
-    """)
+    """
+    params = []
+    if worker_id is not None:
+        query += " AND t.worker_id = ?"
+        params.append(worker_id)
+    query += " ORDER BY t.created_at DESC"
+    cur.execute(query, params)
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -669,6 +723,45 @@ def mark_transaction_completed(transaction_id: int, changed_by: int):
     conn.close()
     if old_status != "Completed":
         log_audit("transactions", transaction_id, "status", old_status, "Completed", changed_by)
+
+
+def mark_transaction_in_progress(transaction_id: int, changed_by: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM transactions WHERE id = ?", (transaction_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return
+    old_status = row["status"]
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute("UPDATE transactions SET status = 'In Progress', updated_at = ? WHERE id = ?", (now, transaction_id))
+    conn.commit()
+    conn.close()
+    if old_status != "In Progress":
+        log_audit("transactions", transaction_id, "status", old_status, "In Progress", changed_by)
+
+
+def cancel_transaction(transaction_id: int, reason: str, changed_by: int):
+    """Soft-cancel only - the row is never deleted, just marked Cancelled
+    and excluded from financial totals and Pending Records. Matches the
+    'prefer soft-delete for financial records' rule."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM transactions WHERE id = ?", (transaction_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return
+    old_status = row["status"]
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "UPDATE transactions SET status = 'Cancelled', notes = COALESCE(notes || ' | ', '') || ?, updated_at = ? WHERE id = ?",
+        (f"Cancelled: {reason}", now, transaction_id),
+    )
+    conn.commit()
+    conn.close()
+    log_audit("transactions", transaction_id, "status", old_status, f"Cancelled ({reason})", changed_by)
 
 
 def mark_transaction_paid(transaction_id: int, changed_by: int):
@@ -709,16 +802,24 @@ def create_expense(worker_id: int, category: str, reason: str, amount: float,
     return row_id, code
 
 
-def get_expenses_today():
+def get_expenses_today(worker_id: int = None):
+    """Pass worker_id to scope to one worker's own expenses only (fixes a
+    privacy gap where the Expense screen's running list showed everyone's
+    expenses, not just the logged-in worker's)."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
+    query = """
         SELECT e.*, u.name AS worker_name
         FROM expenses e
         JOIN users u ON u.id = e.worker_id
         WHERE date(e.created_at) = date('now', 'localtime')
-        ORDER BY e.created_at DESC
-    """)
+    """
+    params = []
+    if worker_id is not None:
+        query += " AND e.worker_id = ?"
+        params.append(worker_id)
+    query += " ORDER BY e.created_at DESC"
+    cur.execute(query, params)
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -779,3 +880,213 @@ def save_daily_closing(opening_cash: float, expected_cash: float, actual_cash: f
     """, (expected_cash, actual_cash, difference, closed_by, now))
     conn.commit()
     conn.close()
+
+
+# =====================================================================
+# PHASE 3 — Worker management, service/rate management, PIN security,
+# audit log viewing, and per-app usage totals (for the redesigned
+# foreground-window Activity screen).
+# =====================================================================
+
+# ---- Worker management (Admin only) ----
+
+def get_all_workers_admin():
+    """Every worker/admin account regardless of active status - Worker
+    Management needs to show Inactive/On Leave people too, not just who
+    can currently log in."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users ORDER BY role, name")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def create_worker(name: str, pin: str, role: str, employee_id: str = None):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "INSERT INTO users (name, pin_hash, role, active, status, employee_id, must_change_pin, created_at, updated_at) "
+        "VALUES (?, ?, ?, 1, 'Active', ?, 0, ?, ?)",
+        (name, hash_pin(pin), role, employee_id, now, now),
+    )
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+    return row_id
+
+
+def update_worker(user_id: int, name: str, employee_id: str, changed_by: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, employee_id FROM users WHERE id = ?", (user_id,))
+    old = cur.fetchone()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "UPDATE users SET name = ?, employee_id = ?, updated_at = ? WHERE id = ?",
+        (name, employee_id, now, user_id),
+    )
+    conn.commit()
+    conn.close()
+    if old and old["name"] != name:
+        log_audit("users", user_id, "name", old["name"], name, changed_by)
+
+
+def set_worker_status(user_id: int, status: str, changed_by: int):
+    """status: 'Active' | 'On Leave' | 'Inactive'. Active is the only
+    status that can log in - On Leave and Inactive both block login
+    (active=0), but stay visually distinct in Worker Management."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM users WHERE id = ?", (user_id,))
+    old = cur.fetchone()
+    now = datetime.now().isoformat(timespec="seconds")
+    active = 1 if status == "Active" else 0
+    cur.execute(
+        "UPDATE users SET status = ?, active = ?, updated_at = ? WHERE id = ?",
+        (status, active, now, user_id),
+    )
+    conn.commit()
+    conn.close()
+    if old and old["status"] != status:
+        log_audit("users", user_id, "status", old["status"], status, changed_by)
+
+
+def admin_reset_pin(user_id: int, new_pin: str, changed_by: int, require_change: bool = True):
+    """Admin resets someone's PIN (e.g. for a shift-cover worker or a
+    forgotten PIN). require_change=True forces a change prompt at next
+    login, so a temporary PIN can't stay in permanent use unnoticed."""
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "UPDATE users SET pin_hash = ?, must_change_pin = ?, updated_at = ? WHERE id = ?",
+        (hash_pin(new_pin), 1 if require_change else 0, now, user_id),
+    )
+    conn.commit()
+    conn.close()
+    log_audit("users", user_id, "pin_hash", "(hidden)", "(reset by admin)", changed_by)
+
+
+def change_own_pin(user_id: int, current_pin: str, new_pin: str) -> bool:
+    """Worker/Admin changes their own PIN. Returns False if current_pin is
+    wrong (and nothing is changed); True on success."""
+    user = verify_login(user_id, current_pin)
+    if user is None:
+        return False
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.execute(
+        "UPDATE users SET pin_hash = ?, must_change_pin = 0, updated_at = ? WHERE id = ?",
+        (hash_pin(new_pin), now, user_id),
+    )
+    conn.commit()
+    conn.close()
+    log_audit("users", user_id, "pin_hash", "(hidden)", "(changed by self)", user_id)
+    return True
+
+
+# ---- Service / rate management (Admin only) ----
+
+def get_all_services_admin():
+    """Every service regardless of active status, for the management screen."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM services ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def create_service(name: str, rate: float, changed_by: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+    cur.execute(
+        "INSERT INTO services (name, rate, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+        (name, rate, now, now),
+    )
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+    log_audit("services", row_id, "created", None, f"{name} @ Rs{rate}", changed_by)
+    return row_id
+
+
+def update_service_rate(service_id: int, new_rate: float, changed_by: int):
+    """Existing transactions already stored their own rate at the time they
+    were created, so changing a service's rate here never alters past
+    records - only future New Job entries will see the new price."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, rate FROM services WHERE id = ?", (service_id,))
+    old = cur.fetchone()
+    now = datetime.now().isoformat()
+    cur.execute("UPDATE services SET rate = ?, updated_at = ? WHERE id = ?", (new_rate, now, service_id))
+    conn.commit()
+    conn.close()
+    if old and old["rate"] != new_rate:
+        log_audit("services", service_id, "rate", old["rate"], new_rate, changed_by)
+
+
+def set_service_active(service_id: int, active: bool, changed_by: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, active FROM services WHERE id = ?", (service_id,))
+    old = cur.fetchone()
+    now = datetime.now().isoformat()
+    cur.execute("UPDATE services SET active = ?, updated_at = ? WHERE id = ?", (1 if active else 0, now, service_id))
+    conn.commit()
+    conn.close()
+    if old and bool(old["active"]) != active:
+        log_audit("services", service_id, "active", bool(old["active"]), active, changed_by)
+
+
+# ---- Audit log viewer (Admin only) ----
+
+def get_audit_logs(table_name: str = None, limit: int = 200):
+    conn = get_connection()
+    cur = conn.cursor()
+    query = """
+        SELECT al.*, u.name AS changed_by_name
+        FROM audit_logs al
+        LEFT JOIN users u ON u.id = al.changed_by
+        WHERE 1=1
+    """
+    params = []
+    if table_name:
+        query += " AND al.table_name = ?"
+        params.append(table_name)
+    query += " ORDER BY al.id DESC LIMIT ?"
+    params.append(limit)
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ---- Activity usage totals (for the redesigned Activity screen) ----
+
+def get_today_app_usage_totals(worker_id: int = None):
+    """Total time spent per application today, longest first - powers
+    'TODAY'S APPLICATION USAGE'. Only counts activity that has actually
+    ended (has a duration); the one currently open app is tracked live in
+    memory by the monitor itself, not from this historical query."""
+    conn = get_connection()
+    cur = conn.cursor()
+    query = """
+        SELECT app_name, SUM(duration_seconds) AS total_seconds
+        FROM application_activity
+        WHERE date(start_time) = date('now', 'localtime') AND duration_seconds IS NOT NULL
+    """
+    params = []
+    if worker_id is not None:
+        query += " AND worker_id = ?"
+        params.append(worker_id)
+    query += " GROUP BY app_name ORDER BY total_seconds DESC"
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
